@@ -1,0 +1,203 @@
+esphome:
+  name: projector-connector
+  friendly_name: projector-connector
+
+  # https://esphome.io/components/esphome.html#esphome-on-boot
+  # we don't know the power state of the projector right after the esp has booted
+  # so our first job is to ask the projector
+  # any changes in power state after this, the projector will broadcast automatically
+  on_boot:
+    # low priority means run late, we want to do this once everything is ready
+    priority: -100
+    then:
+      # wait an extra five seconds to make sure projector is ready to answer us
+      - delay: 5s
+      - uart.write: [0x7E, 0x30, 0x30, 0x31, 0x32, 0x34, 0x20, 0x31, 0x0D]
+      - delay: 5s
+      - uart.write: [0x7E, 0x30, 0x30, 0x31, 0x32, 0x31, 0x20, 0x31, 0x0D]
+
+# Use built-in ESPHome capabilities for reading UART          
+
+esp32:
+  board: esp32-s3-devkitc-1
+  #board: m5stack-atoms3
+  framework:
+    type: arduino  
+
+# Enable logging
+logger:
+  level: debug
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: !secret ap_ssid
+    password: !secret ap_password
+
+captive_portal:
+
+uart:
+  id: uart_bus
+  rx_pin: GPIO5
+  tx_pin: GPIO6
+  baud_rate: 9600
+  stop_bits: 1
+  debug:
+    direction: RX
+    dummy_receiver: true
+    after:
+      delimiter: "\r"
+    sequence:
+      - lambda: |-
+          std::string response = format_hex_pretty((uint8_t*)bytes.data(), bytes.size());
+          ESP_LOGD("projector", "Received: %s", response.c_str());
+          
+          // Convert to string for processing
+          std::string str_data(bytes.begin(), bytes.end());
+          
+          // Force to uppercase
+          std::transform(str_data.begin(), str_data.end(), str_data.begin(), ::toupper);
+          
+          // Process projector responses
+          bool handled = false;
+          
+          // Command responses (P/F)
+          if (str_data == "P" || str_data == "F") {
+            id(waiting_for_command_response) = false;
+            ESP_LOGD("projector", "command response received");
+            handled = true;
+          }
+          
+          // Power status - handle both OK and Ok formats
+          if (str_data == "OK1" || str_data == "Ok1" || str_data == "INFO1") {
+            id(projector_power).publish_state(true);
+            handled = true;
+          }
+          
+          if (str_data == "OK0" || str_data == "Ok0" || str_data == "INFO2" || str_data == "INFO0") {
+            id(projector_power).publish_state(false);
+            handled = true;
+          }
+          
+          // Check for any input source response patterns
+          if (str_data.find("OK") != std::string::npos || str_data.find("Ok") != std::string::npos) {
+            
+            // Extract everything after OK/Ok
+            std::string suffix = "";
+            if (str_data.find("OK") != std::string::npos) {
+              suffix = str_data.substr(str_data.find("OK") + 2);
+            } else if (str_data.find("Ok") != std::string::npos) {
+              suffix = str_data.substr(str_data.find("Ok") + 2);
+            }
+            ESP_LOGD("projector", "Suffix after OK/Ok: '%s'", suffix.c_str());
+            
+             if (suffix == "9") {
+               id(projector_source).publish_state("HDMI 3");
+               handled = true;
+             } else if (suffix == "8") {
+               id(projector_source).publish_state("HDMI 2");
+               handled = true;
+             } else if (suffix == "7") {
+               id(projector_source).publish_state("HDMI 1");
+               handled = true;
+             } else {
+               ESP_LOGD("projector", "UNKNOWN INPUT SOURCE CODE: '%s'", suffix.c_str());
+               ESP_LOGD("projector", "Known UHZ50 codes: 9=HDMI3, 8=HDMI2, 7=HDMI1");
+             }
+          }
+          
+          if (!handled) {
+            ESP_LOGD("projector", "unhandled message: %s", str_data.c_str());
+          }  
+
+# Docs source https://www.optomaeurope.com/ContentStorage/Documents/17f005d3-0d27-4822-b9f6-20f04085dbaf.pdf
+# create a global flag we can use when we've sent a command (turn on / turn off)
+# this may be used to ignore commands when one is queued already, this does not seem necessary in practice
+globals:
+- id: waiting_for_command_response
+  type: bool
+  restore_value: no
+  initial_value: 'false'
+
+# UART data processing now happens directly in the uart debug lambda above
+# Empty text_sensor section for compatibility
+text_sensor:
+
+switch:
+  - platform: template
+    name: "Projector Power"
+    icon: "mdi:projector"
+    id: projector_power
+    optimistic: true
+
+    turn_on_action:
+      # first set the flag to denote we have a command response to wait for
+      - globals.set:
+          id: waiting_for_command_response
+          value: 'true'
+      # send the turn on command
+      - uart.write: [0x7E, 0x30, 0x30, 0x30, 0x30, 0x20, 0x31, 0x0D]       
+    
+    turn_off_action:
+      # first set the flag to denote we have a command response to wait for
+      - globals.set:
+          id: waiting_for_command_response
+          value: 'true'
+      # send the turn off command
+      - uart.write: [0x7E, 0x30, 0x30, 0x30, 0x30, 0x20, 0x30, 0x0D]
+
+select:
+  - platform: template
+    name: "Projector Source"
+    icon: "mdi:video-input-hdmi"
+    id: projector_source
+    optimistic: false
+
+    options:
+     - "HDMI 1"
+     - "HDMI 2"
+     - "HDMI 3"
+    
+    set_action:
+      then:
+        - uart.write: !lambda |-
+            std::string value = x;
+            if (value == "HDMI 1") {
+              return {0x7E, 0x30, 0x30, 0x31, 0x32, 0x20, 0x31, 0x0D};
+            } else if (value == "HDMI 2") {
+              return {0x7E, 0x30, 0x30, 0x31, 0x32, 0x20, 0x31, 0x35, 0x0D};
+            } else if (value == "HDMI 3") {
+              return {0x7E, 0x30, 0x30, 0x31, 0x32, 0x20, 0x31, 0x36, 0x0D};
+            }
+            // Fallback for unknown values
+            return {0x7E, 0x30, 0x30, 0x31, 0x32, 0x20, 0x31, 0x0D};
+        # Wait much longer for projector to switch and then query source for confirmation
+        - delay: 5s
+        - uart.write: [0x7E, 0x30, 0x30, 0x31, 0x32, 0x31, 0x20, 0x31, 0x0D]
+
+interval:
+# I set this up for 20 seconds as the Optoma projector seems to get a 
+# bit confused when too many commands come in at once - and stops accepting
+# remote (IR) and Serial commands until the power is reset.
+# setting this for 20s reduces the chance of overlapping commands being sent
+# when sennding power on/ off commands from home assistant.
+  - interval: 20s
+    then:
+        # Query power status
+      - uart.write: [0x7E, 0x30, 0x30, 0x31, 0x32, 0x34, 0x20, 0x31, 0x0D] 
+        # Longer pause between commands - projector needs time
+      - delay: 5s
+        # Query input source (using 121 command for read)
+      - uart.write: [0x7E, 0x30, 0x30, 0x31, 0x32, 0x31, 0x20, 0x31, 0x0D]
