@@ -66,6 +66,10 @@ uart:
           
           // Convert to string for processing
           std::string str_data(bytes.begin(), bytes.end());
+
+          // Remove carriage return and newline characters
+          str_data.erase(std::remove(str_data.begin(), str_data.end(), '\r'), str_data.end());
+          str_data.erase(std::remove(str_data.begin(), str_data.end(), '\n'), str_data.end());
           
           // Force to uppercase
           std::transform(str_data.begin(), str_data.end(), str_data.begin(), ::toupper);
@@ -76,7 +80,7 @@ uart:
           // Command responses (P/F)
           if (str_data == "P" || str_data == "F") {
             id(waiting_for_command_response) = false;
-            ESP_LOGD("projector", "command response received");
+            ESP_LOGD("projector", "command response received: %s", str_data.c_str());
             handled = true;
           }
           
@@ -91,8 +95,9 @@ uart:
             handled = true;
           }
           
-          // Check for any input source response patterns
-          if (str_data.find("OK") != std::string::npos || str_data.find("Ok") != std::string::npos) {
+          // Only attempt to parse input source if NOT already handled as power
+          // This prevents "Suffix after OK/Ok: '0'" logs when power is OFF
+          if (!handled && (str_data.find("OK") != std::string::npos || str_data.find("Ok") != std::string::npos)) {
             
             // Extract everything after OK/Ok
             std::string suffix = "";
@@ -101,6 +106,7 @@ uart:
             } else if (str_data.find("Ok") != std::string::npos) {
               suffix = str_data.substr(str_data.find("Ok") + 2);
             }
+            
             ESP_LOGD("projector", "Suffix after OK/Ok: '%s'", suffix.c_str());
             
              if (suffix == "9") {
@@ -112,9 +118,16 @@ uart:
              } else if (suffix == "7") {
                id(projector_source).publish_state("HDMI 1");
                handled = true;
+             } else if (suffix == "C00?" || suffix == "C00") {
+                // This seems to be the response when projector is OFF or searching
+                ESP_LOGD("projector", "Projector reports searching/no signal or is OFF (code C00?)");
+                handled = true;
              } else {
-               ESP_LOGD("projector", "UNKNOWN INPUT SOURCE CODE: '%s'", suffix.c_str());
-               ESP_LOGD("projector", "Known UHZ50 codes: 9=HDMI3, 8=HDMI2, 7=HDMI1");
+               // Only log as unknown if we haven't handled it as power status above (OK0/OK1)
+               if (!handled) {
+                 ESP_LOGD("projector", "UNKNOWN INPUT SOURCE CODE: '%s'", suffix.c_str());
+                 ESP_LOGD("projector", "Known UHZ50 codes: 9=HDMI3, 8=HDMI2, 7=HDMI1");
+               }
              }
           }
           
@@ -140,7 +153,8 @@ switch:
     name: "Projector Power"
     icon: "mdi:projector"
     id: projector_power
-    optimistic: true
+    # Set to false to ensure UI reflects actual projector state from UART feedback
+    optimistic: false
 
     turn_on_action:
       # first set the flag to denote we have a command response to wait for
@@ -148,7 +162,10 @@ switch:
           id: waiting_for_command_response
           value: 'true'
       # send the turn on command
-      - uart.write: [0x7E, 0x30, 0x30, 0x30, 0x30, 0x20, 0x31, 0x0D]       
+      - uart.write: [0x7E, 0x30, 0x30, 0x30, 0x30, 0x20, 0x31, 0x0D]
+      # Wait a bit for the projector to process and then query status to update UI
+      - delay: 3s
+      - uart.write: [0x7E, 0x30, 0x30, 0x31, 0x32, 0x34, 0x20, 0x31, 0x0D]
     
     turn_off_action:
       # first set the flag to denote we have a command response to wait for
@@ -157,6 +174,20 @@ switch:
           value: 'true'
       # send the turn off command
       - uart.write: [0x7E, 0x30, 0x30, 0x30, 0x30, 0x20, 0x30, 0x0D]
+      # Wait a bit for the projector to process and then query status to update UI
+      - delay: 3s
+      - uart.write: [0x7E, 0x30, 0x30, 0x31, 0x32, 0x34, 0x20, 0x31, 0x0D]
+
+   # Experimental Mute Switch (Command ~0002 1/0 is standard, ~00140 1/0 for some models)
+  - platform: template
+    name: "Projector Mute"
+    icon: "mdi:volume-off"
+    id: projector_mute
+    optimistic: true
+    turn_on_action:
+      - uart.write: [0x7E, 0x30, 0x30, 0x30, 0x32, 0x20, 0x31, 0x0D] # ~0002 1
+    turn_off_action:
+      - uart.write: [0x7E, 0x30, 0x30, 0x30, 0x32, 0x20, 0x30, 0x0D] # ~0002 0
 
 select:
   - platform: template
@@ -186,6 +217,69 @@ select:
         # Wait much longer for projector to switch and then query source for confirmation
         - delay: 5s
         - uart.write: [0x7E, 0x30, 0x30, 0x31, 0x32, 0x31, 0x20, 0x31, 0x0D]
+
+  # Display Mode Select
+  # Verified against Optoma UHZ50 Protocol Doc (17f005d3...) provided by user.
+  # Command ~XX20 n (Write), ~XX123 1 (Read)
+  - platform: template
+    name: "Projector Display Mode"
+    icon: "mdi:palette"
+    id: projector_display_mode
+    optimistic: true
+    options:
+      - "Presentation"
+      - "Bright"
+      - "Cinema"
+      - "Game"
+      - "sRGB"
+      - "DICOM SIM."
+      - "User"
+      - "3D"
+      - "User (3D)"
+    set_action:
+      - uart.write: !lambda |-
+          std::string value = x;
+          // Command ~XX20 n
+          if (value == "Presentation") return {0x7E, 0x30, 0x30, 0x32, 0x30, 0x20, 0x31, 0x0D};      // ID 1
+          if (value == "Bright")       return {0x7E, 0x30, 0x30, 0x32, 0x30, 0x20, 0x32, 0x0D};      // ID 2
+          if (value == "Cinema")       return {0x7E, 0x30, 0x30, 0x32, 0x30, 0x20, 0x33, 0x0D};      // ID 3
+          if (value == "Game")         return {0x7E, 0x30, 0x30, 0x32, 0x30, 0x20, 0x31, 0x32, 0x0D}; // ID 12
+          if (value == "sRGB")         return {0x7E, 0x30, 0x30, 0x32, 0x30, 0x20, 0x34, 0x0D};      // ID 4
+          if (value == "DICOM SIM.")   return {0x7E, 0x30, 0x30, 0x32, 0x30, 0x20, 0x31, 0x33, 0x0D}; // ID 13 (Wait, 13 is 3D in other list, checking table)
+          // Table says: 13 = DICOM SIM (Wait, table says 13 in row 6? No, row 5 is 3D)
+          // Let's re-read the table image carefully.
+          // Level 4 column: Presentation (1), Bright (2), Cinema (3), Game (12), sRGB (4), DICOM SIM. (13), User (5), 3D (9), User(3D) (6).
+          // Wait, the values in 'Set Para' column are: 1, 2, 3, 12, 4, 13, 5, 9, 6.
+          
+          if (value == "DICOM SIM.")   return {0x7E, 0x30, 0x30, 0x32, 0x30, 0x20, 0x31, 0x33, 0x0D}; // ID 13
+          if (value == "User")         return {0x7E, 0x30, 0x30, 0x32, 0x30, 0x20, 0x35, 0x0D};      // ID 5
+          if (value == "3D")           return {0x7E, 0x30, 0x30, 0x32, 0x30, 0x20, 0x39, 0x0D};      // ID 9
+          if (value == "User (3D)")    return {0x7E, 0x30, 0x30, 0x32, 0x30, 0x20, 0x36, 0x0D};      // ID 6
+          
+          return {};
+
+number:
+  # Volume Control
+  # Based on standard Optoma Command 03.
+  - platform: template
+    name: "Projector Volume"
+    id: projector_volume
+    icon: "mdi:volume-high"
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: true
+    set_action:
+      - uart.write: !lambda |-
+          // Command ~0003 <n>
+          // Convert number to string
+          std::string val = std::to_string((int)x);
+          std::vector<uint8_t> data = {0x7E, 0x30, 0x30, 0x30, 0x33, 0x20}; // Prefix ~0003_
+          for (char c : val) {
+            data.push_back(c);
+          }
+          data.push_back(0x0D); // CR
+          return data;
 
 interval:
 # I set this up for 20 seconds as the Optoma projector seems to get a 

@@ -133,38 +133,67 @@ After integration, you'll have these entities in Home Assistant:
 
 | Entity | Type | Description |
 |--------|------|-------------|
-| `switch.projector_power` | Switch | Turn projector ON/OFF |
-| `select.projector_source` | Select | Choose input source (HDMI 1/2/3) |
+| `switch.projector_connector_projector_power` | Switch | Turn projector ON/OFF |
+| `switch.projector_connector_projector_mute` | Switch | Mute Audio |
+| `select.projector_connector_projector_source` | Select | Choose input source (HDMI 1/2/3) |
+| `select.projector_connector_projector_display_mode` | Select | Choose Picture Mode (Cinema, Game, etc.) |
+| `number.projector_connector_projector_volume` | Number | Volume Control (0-100) |
 
-## Usage Examples
+## Creating Universal Media Player
 
-### Automation Example
+To create a full-featured `media_player` entity in Home Assistant (with Volume & Mute!), add this to your `configuration.yaml`:
+
 ```yaml
-# automation.yaml
-- alias: "Turn on projector when media starts"
-  trigger:
-    - platform: state
-      entity_id: media_player.living_room_tv
-      to: "playing"
-  action:
-    - service: switch.turn_on
-      entity_id: switch.projector_power
-    - delay: "00:00:05"
-    - service: select.select_option
-      entity_id: select.projector_source
-      data:
-        option: "HDMI 1"
+# configuration.yaml
+media_player:
+  - platform: universal
+    name: "Optoma UHZ50 Projector"
+    unique_id: optoma_uhz50_projector
+    device_class: tv
+    
+    commands:
+      turn_on:
+        action: switch.turn_on
+        target:
+          entity_id: switch.projector_connector_projector_power
+      
+      turn_off:
+        action: switch.turn_off
+        target:
+          entity_id: switch.projector_connector_projector_power
+      
+      select_source:
+        action: select.select_option
+        target:
+          entity_id: select.projector_connector_projector_source
+        data:
+          option: "{{ source }}"
+      
+      volume_set:
+        action: number.set_value
+        target:
+          entity_id: number.projector_connector_projector_volume
+        data:
+          value: "{{ volume_level * 100 }}"
+
+      volume_mute:
+        action: "switch.turn_{{ 'on' if is_volume_muted else 'off' }}"
+        target:
+          entity_id: switch.projector_connector_projector_mute
+    
+    attributes:
+      state: switch.projector_connector_projector_power
+      source: select.projector_connector_projector_source
+      source_list: select.projector_connector_projector_source|options
+      is_volume_muted: switch.projector_connector_projector_mute
+      volume_level: |
+        {{ states('number.projector_connector_projector_volume') | float(0) / 100.0 }}
 ```
 
-### Lovelace Card Example
-```yaml
-# Add to your dashboard
-type: entities
-title: Projector Control
-entities:
-  - switch.projector_power
-  - select.projector_source
-```
+After adding this configuration:
+1. Restart Home Assistant or execute "Check Configuration" then restart
+2. You'll get `media_player.optoma_uhz50_projector` entity
+3. It will work as a standard media player with all functions
 
 ## Protocol Details
 
